@@ -1,1 +1,955 @@
-toto je test
+///$tab Introduction
+// Snowflake Dashboard:
+
+// This Qlik Sense app combines data from multiple Snowflake tables to create an understanding of four key areas.
+
+// - Cost / Usage Analysis: There are two versions of this focused on pay-as-you go models or Enterprise credit purchases.
+// - Auditing / Security: Show who is logging in from where (GeoAnalytics) and metrics associated with Security and Connectivity.
+// - Performance & Optimization: Who is running queries, where are there issues - how does this relate to cost and usage?
+// - Connection Details: Show which Qlik products are driving the usage
+//---------------------------------------------------------------------
+
+// Created by David Freriks - Technology Evangelist @ Qlik
+// Creation Date:  8/15/2019
+// Updated to Version 3 with multiple instances and incremental loads by Dalton Ruer - 6/11/2021
+// Updated to Version 3.1 Removed dependencies on extensions and provided ability to work in SaaS; Modified model to support each SF instance having different costs. Dalton Ruer - 6/25/2021
+// Updated to Version 4.0 Added ability to store complete tables, and Aggregate up the Query History at the instance level instead of retaining it all in the application. Dalton Ruer - 9/27/2021
+/* 🔥🔥🔥🔥🔥
+// Updated to Version 5.0 to remove the complexity of dealing with QVD's for those that have simple instances and want to track a limited range of time rather than retaining years of data 4/12/2023
+
+Split to Version 5 which only asks for a rolling X days of data so that Query History can be viewed within the application 
+including all of the query stat stuff like disk spillage we had not been capturing in the past. 
+
+There is no incremental load for this version and instead it's just purely a get me last X days of data to keep things super simple for those environments
+that really don't want the complexity as they are new to Qlik or simply don't need to focus on data that is older than X days anyway.
+
+If you do wish to track lots of data for longer periods of time and are familiiar with Qlik and ODAG then version 4.0 would be a better fit for you. 
+
+Version 5 introduced a Partial Reload so that you could pull and visualize the Query Stats for a single selected Query. If you DO NOT NEED that functionality feel
+free to remove the Query Stats screen and the Partial Reload section of Code and adjust the rest of the code accordingly as it will expect the IF so you need to adjust. 
+*/ 
+
+//---------------------------------------------------------------------
+
+// Details and source available @ https://github.com/Qlik-PE/Snowflake-Usage-Analysis-Dashboard
+
+//---------------------------------------------------------------------
+
+// By default the User account for Snowflake needs either ACCOUNTADMIN rights or access to the "SNOWFLAKE" tables unless the schema is 
+// modified to provide permissions to other ROLES. 
+
+
+/* 🔥🔥🔥🔥🔥
+HEADS UP INFORMATION TO KNOW
+
+The Query History information is ready immediately following all queries. However, the SESSION information is not and is instead "batched" within Snowflake.
+As a result you may see queries that have no associated user name, no connection type etc. More often than not if you refresh again after 10-15 minutes those session values 
+will be available and pulled. But there is always going to be some that aren't as a result of the delay. ****ALSO**** in pulling data for years now we have found that some session 
+information never makes it to the session tables and you will simply see the typical Qlik - for missing values. We have never been able to trace exactly what the pattern is to what 
+doesn't make it or why. 
+*/ 
+
+/* 🔥🔥🔥🔥🔥
+Time to load and data model
+
+The Snowflake Databases, Tables and Columns information may not be needed in your environment and they do tend to take a lot of time to load. As such, if you do not need to track the that 
+information feel free to move those sections below the Exit Script section and remove the Sheet on which they are shown. Your load times will be faster and your data model will be reduced.
+*/
+
+///$tab Main Variables
+SET ThousandSep=',';
+SET DecimalSep='.';
+SET MoneyThousandSep=',';
+SET MoneyDecimalSep='.';
+SET MoneyFormat='$#,##0.00;-$#,##0.00';
+SET TimeFormat='h:mm:ss TT';
+SET DateFormat='M/D/YYYY';
+SET TimestampFormat='M/D/YYYY h:mm:ss[.fff] TT';
+SET FirstWeekDay=6;
+SET BrokenWeeks=1;
+SET ReferenceDay=0;
+SET FirstMonthOfYear=1;
+SET CollationLocale='en-US';
+SET CreateSearchIndexOnReload=1;
+SET MonthNames='Jan;Feb;Mar;Apr;May;Jun;Jul;Aug;Sep;Oct;Nov;Dec';
+SET LongMonthNames='January;February;March;April;May;June;July;August;September;October;November;December';
+SET DayNames='Mon;Tue;Wed;Thu;Fri;Sat;Sun';
+SET LongDayNames='Monday;Tuesday;Wednesday;Thursday;Friday;Saturday;Sunday';
+SET NumericalAbbreviation='3:k;6:M;9:B;12:T;15:P;18:E;21:Z;24:Y;-3:m;-6:μ;-9:n;-12:p;-15:f;-18:a;-21:z;-24:y';
+
+// Dalton Ruer - I disabled SearchOnReload simply because I reloaded and adjusted the code hundreds of times over the course of the many version updates
+// feel free to change it to a 1 in your environment so that end users can search without waiting. 
+Set CreateSearchIndexOnReload=0;
+
+Set HidePrefix='_';
+Set vHelpFor = 'Usage Dashboard';
+
+// ✋ - Important when installing this to set this variable correctly,
+// and configure your QVD file storage location
+// The GeoAnalytics section has if statement to work appropriately based on environment 
+Set vWindowsOrSaaS = 'SaaS';
+
+If (vWindowsOrSaaS = 'Windows') Then
+	Set vQVDLocation = 'lib://QVD (qlikpe_qlikservice)/Snowflake/';
+Else
+	Set vQVDLocation = 'lib://Snowflake:DataFiles/';
+End If;
+
+// 🔥🔥🔥🔥🔥 Creates a rolling X days you can change the number to anything that you want it to be for your environment
+Let vMaxQueryTime = Date(Floor(Now()-13),'YYYY-MM-DD');
+
+
+
+///$tab Variables and Islands
+Set vCreditsUsed = Num(Sum(CREDITS_USED), '#,##0');
+Set vCloudCreditsUsed = Num(Sum(CREDITS_USED_CLOUD_SERVICES), '#,##0');
+Set vUsageBilled = Num(Sum([Usage Cost]), '$#,##0');
+Set vCloudBilled = Num($(vCloudCreditsUsed) * vPrice, '$#,##0');
+Set vTotalQueries = Num(Count(QUERY_ID), '#,##0');
+Set vTotalQueriesSuccess = Num(Sum("Successfull Query Flag"), '#,##0');
+Set vTotalQueriesFail = Num(Sum("Failed Query Flag"), '#,##0');
+Set vTotalLocalSpillage = Num(Sum("Local Spillage Flag"), '#,##0');
+Set vTotalRemoteSpillage = Num(Sum("Remote Spillage Flag"), '#,##0');
+Set vTotalProblematicQueries = Num(Sum("Problematic Query Flag"), '#,##0');
+
+Set vTotalStorage = Num(Sum(Aggr(Avg(STORAGE_BYTES/1000000000000),[Warehouse_Start_Time.autoCalendar.YearMonth])), '#,##0.00');
+Set vStorageCost = Num(Sum(Aggr(Avg([Storage Cost]),[Warehouse_Start_Time.autoCalendar.YearMonth])), '$#,##0');
+Set vUsageBilledQDI = Num(Sum({<[Connection Parent] = {'QDI'}>} [Usage Cost], '$#,##0');
+Set vUsageBilledQDA = Num(Sum({<[Connection Parent] = {'QDA'}>} [Usage Cost], '$#,##0');
+Set vUsageBilledOther = Num(Sum({<[Connection Parent] -= {'QDA','QDI'}>} [Usage Cost], '$#,##0');
+Set vUsageBilledQDI% = Num($(vUsageBilledQDI) / $(vUsageBilled), '##0.0%');
+Set vUsageBilledQDA% = Num($(vUsageBilledQDA) / $(vUsageBilled), '##0.0%');
+Set vUsageBilledOther% = Num($(vUsageBilledOther) / $(vUsageBilled), '##0.0%');
+Set vCreditsPurchased = Num(Sum([Credits Purchased]), '#,##0');
+
+If (IsPartialReload() = FALSE()) THEN
+    MeasureIsland1:
+    Add Load * Inline [
+    _MeasureName1, _MeasureVariable1, _MeasureDescription1
+    # Total Queries, vTotalQueries, Number of queries that have been executed based on QUERY_ID
+    # Queries Success, vTotalQueriesSuccess, Number of queries that ran successfully
+    # Queries Fail, vTotalQueriesFail, Number of queries that failed to execute
+    # Credits Used, vCreditsUsed, Number of Credits Used (approximated when broken out by dimensions)
+    # Cloud Credits Used, vCloudCreditsUsed, Number of Cloud Credits used (approximated when broken out by dimensions)
+    # Total Storage (TB), vTotalStorage, Total TB of Storage used based STORAGE_BYTES
+    # Queries w/Local Spill, vTotalLocalSpillage, Number of queries that had local spillage
+    # Queries w/Remote Spill, vTotalRemoteSpillage, Number of queries that had remote spillage
+    # Queries w/Problematic Plan, vTotalProblematicQueries, Number of queries that had spillage or all partitions were scanned
+    $ Usage Billed, vUsageBilled, Dollars billed (approximated when broken out by dimensions)
+    $ Cloud Billed, vCloudBilled, Dollars billed (approximated when broken out by dimensions)
+    $ Storage Billed, vStorageCost, Dollars billed for storage based STORAGE_BYTES (in TB) * variable Stored Cost
+    ];
+
+    MeasureIsland2:
+    Add Load 
+        _MeasureName1 as _MeasureName2,
+        _MeasureVariable1 as _MeasureVariable2, 
+        _MeasureDescription1 as _MeasureDescription2
+    Resident MeasureIsland1;
+
+    MeasureIsland3:
+    Add Load 
+        _MeasureName1 as _MeasureName3,
+        _MeasureVariable1 as _MeasureVariable3, 
+        _MeasureDescription1 as _MeasureDescription3
+    Resident MeasureIsland1;
+
+    /* 📝 - Similar to the Measure Islands Dimension Islands exist so that the end user can choose how to slice the charts. 
+    Unlike the Measure Islands, these Dimension Islands are NOT identical. 
+    So that Island1 can be used on 1 screen but in other cases/screens Island2 can be used with more/fewer options as needed.
+
+    Visually the aesthetics for allowing users to choose the dimension fit better being horizontal. However, Qlik's filter control
+    doesn't support horizontal so we implemented with buttons in order to provide the same thing. Which means if you add to or remove from
+    the canned list of Dimensions you will need to add/remove a button. 
+
+    If your organization utilizes any extensions like VizLib filter, then you should replace the buttons with the extension to make your life
+    easier as you add/remove options for end users. 
+    */ 
+
+    DimensionIsland1:
+    Add Load * Inline [
+    _DimensionName1, _DimensionField1, _DimensionDescription1
+    Qlik Application Type, Connection Parent, Determined based on the connection string which started being tracked mid July 2020
+    Snowflake Instance, SFConx, Identifies the Snowflake Instance where the data came from 
+    User Name, USER_NAME, The Snowflake User Name used for the connection
+    Query Type, QUERY_TYPE, The type of query that was executed
+    Warehouse Size, WAREHOUSE_SIZE, The size of the Warehouse when queries were executed
+    Cost Center, Cost Center, Name of the Cost Center user is part of
+    ];
+
+    DimensionIsland2:
+    Add Load * Inline [
+    _DimensionName2, _DimensionField2, _DimensionDescription2
+    Qlik Application Type, Connection Parent, Determined based on the connection string which started being tracked mid July 2020
+    Snowflake Instance, SFConx, Identifies the Snowflake Instance where the data came from 
+    User Name, USER_NAME, The Snowflake User Name used for the connection
+    Query Type, QUERY_TYPE, The type of query that was executed
+    Warehouse Size, WAREHOUSE_SIZE, The size of the Warehouse when queries were executed
+    Execution Status, EXECUTION_STATUS, Status of the query
+    Database Name, DB_NAME, Name of database query ran against
+    Cost Center, Cost Center, Name of the Cost Center user is part of
+    ];
+
+End If;
+
+
+///$tab Snowflake Instances
+If (IsPartialReload() = FALSE()) THEN
+  CurrentYear_Quotas:
+  Add Load * Inline [
+  CY_Type, CY_Costs, CY_Period
+  Partner, 1500, Monthly
+  PrePaid, 25000, Yearly
+  ];
+
+  // Add as many instances as you would like and the Startup spin through section will iterate through each of them 
+  SnowflakeInstances:
+  Add Load * Inline [
+  SFConx, SFInstance, CostPerCredit, CostPerTB, Credits Purchased, CY_Type
+  SF_PE, 'Snowflake_odkkipk-on85957.snowflakecomputing.com', 2.00, 40.00, 2000, Partner
+  ];
+
+End if;
+
+///$tab Inline tables 
+If (IsPartialReload() = FALSE()) THEN
+  // Inline tables that will be needed somewhere. Feel free to change the names or group as desired and add as many other tools as may be used in your environment
+  ConnectionMap:
+  Mapping Load * Inline [
+  MatchValue, MatchTerm
+  0, No Match
+  1, Qlik Replicate
+  2, Qlik Replicate
+  3, Qlik Compose
+  4, Qlik Sense
+  5, Qlik Sense,
+  6, Live Query,
+  7, Qlik Sense SaaS
+  8, Qlik Catalog
+  ];
+
+  // Version 4.0 - Modified to be a mapping load and loaded into the Session stable instead of needing the extra hop
+  ConnectionTypesMap:
+  Add Load * Inline [
+  Connection Type, Connection Parent
+  Qlik Replicate, QDI
+  Qlik Compose, QDI
+  Qlik Catalog, QDI
+  Qlik Sense, QDA
+  Live Query, SSE
+  Qlik Sense SaaS, QDA
+  No Match, Support Tasks
+  ];
+
+  SortedDaysOfWeek:
+  Add Load * Inline [
+  Query Start DOW
+  Mon
+  Tue
+  Wed
+  Thu
+  Fri
+  Sat
+  Sun
+  ];  
+End if;
+///$tab Partial Reload
+If (IsPartialReload() = True()) THEN
+	Let vReloadMessage = 'Loaded the query stats for $(vQueryId)';
+ 
+ 	// Need to pull the SFConx value from the query history table for the query id that was chosen
+    Let vConx = Lookup('SFConx', 'QUERY_ID', '$(vQueryId)', 'Query History') ;
+    Trace 🛑 VConx = '$(vConx)';
+    
+    Let vConnection = chr(39) & Lookup('SFInstance', 'SFConx', '$(vConx)', 'SnowflakeInstances') & chr(39) ; 
+    Trace 🛑 VConnection = $(vConnection);
+    
+    LIB CONNECT TO $(vConnection);
+    
+    [Query Stats]:
+    Replace Load 
+      QUERY_ID as [QueryID],
+      STEP_ID as [Step ID],
+      OPERATOR_ID as [Operator ID],
+      PARENT_OPERATOR_ID as [Parent Operator ID],
+
+      OPERATOR_TYPE as [Operator Type],
+      OPERATOR_STATISTICS as [Operator Statistics JSON],
+      EXECUTION_TIME_BREAKDOWN as [Excecution Time Breakdown JSON],
+      OPERATOR_ATTRIBUTES as [Operator Attributes JSON],
+
+      OPERATOR_EXECUTION_PCT as [Operator Execution PCT],
+      Num(OUTPUT_ROWS, '#,##0') as [Output Rows],
+      Num(INPUT_ROWS, '#,##0') as [Input Rows],
+
+      If(ROW_MULTIPLE > 1, Dual('Yes', 1), Dual('No', 0)) as [Exploding Join Flag],
+      If(BYTES_SPILLED_LOCAL_STORAGE > 0 OR BYTES_SPILLED_REMOTE_STORAGE > 0, Dual('Yes', 1), Dual('No', 0)) as [Queries To Large Flag],
+      If(UNION_WITHOUT_ALL = 1, Dual('Yes', 1), Dual('No', 0)) as [Union Without All Flag],
+      If(PARTITIONS_SCANNED / PARTITIONS_TOTAL > .8 AND PARTITIONS_TOTAL > 20000,  Dual('Yes', 1), Dual('No', 0)) as [Inefficient Pruning Flag],
+
+      Num(BYTES_SCANNED, '#,##0') as [Bytes Scanned],
+      Num(CACHE_SCAN_RATIO, '##0.00%') as [Cache Scan Ratio],
+
+      Num(BYTES_SPILLED_LOCAL_STORAGE, '#,##0') as [Bytes Spilled Local Storage],
+      Num(BYTES_SPILLED_REMOTE_STORAGE, '#,##0') as [Bytes Spilled Remote Storage],
+
+      Num(PARTITIONS_SCANNED, '#,##0') as [Partitions Scanned],
+      Num(PARTITIONS_TOTAL, '#,##0') as [Partitions Total],
+
+      Replace(JOIN_CONDITION, '"', '') as [Join Codition],
+      Replace(JOIN_TYPE, '"', '') as [Join Type],
+      Replace(JOIN_ID , '"', '')as [Join ID],
+      Replace(TABLE_NAME, '"', '') as [Table Name],
+      Replace(Replace(Replace(COLUMNS, '[',''), ']',''), chr(10), '') as [Columns],
+      Replace(FUNCTIONS, '"', '') as [Functions],
+
+      Num(OFFSET, '#,##0') as [Offset],
+      Num(NUMROWS, '#,##0') as [Num Rows],
+      Replace(SORT_KEYS, '"', '') as [Sort Keys],
+      Replace(GROUPING_KEYS, '"', '') as [Grouping Keys],
+
+      Replace(IO, '"','') as [IO],
+      Replace(PRUNING, '"', '') as [Pruning];  
+    select
+      QUERY_ID,
+      STEP_ID,
+      OPERATOR_ID,
+      PARENT_OPERATOR_ID,
+      OPERATOR_TYPE,
+      OPERATOR_STATISTICS,
+      EXECUTION_TIME_BREAKDOWN,
+      OPERATOR_ATTRIBUTES,
+
+      EXECUTION_TIME_BREAKDOWN:overall_percentage::float as OPERATOR_EXECUTION_PCT,
+      OPERATOR_STATISTICS:output_rows AS OUTPUT_ROWS,
+      OPERATOR_STATISTICS:input_rows AS INPUT_ROWS,
+      OPERATOR_STATISTICS:output_rows / OPERATOR_STATISTICS:input_rows as ROW_MULTIPLE,
+      OPERATOR_STATISTICS:io as IO,
+      OPERATOR_STATISTICS:io:bytes_scanned as BYTES_SCANNED,
+      OPERATOR_STATISTICS:io:percentage_scanned_from_cache as CACHE_SCAN_RATIO,
+      OPERATOR_STATISTICS:spilling:bytes_spilled_local_storage AS BYTES_SPILLED_LOCAL_STORAGE,
+      OPERATOR_STATISTICS:spilling:bytes_spilled_remote_storage AS BYTES_SPILLED_REMOTE_STORAGE,
+
+      OPERATOR_STATISTICS:pruning as PRUNING,
+      OPERATOR_STATISTICS:pruning:partitions_scanned AS PARTITIONS_SCANNED,
+      OPERATOR_STATISTICS:pruning:partitions_total AS PARTITIONS_TOTAL,
+
+      OPERATOR_ATTRIBUTES:equality_join_condition as JOIN_CONDITION,
+      OPERATOR_ATTRIBUTES:join_type as JOIN_TYPE,
+      OPERATOR_ATTRIBUTES:join_id as JOIN_ID,
+      OPERATOR_ATTRIBUTES:table_name as TABLE_NAME,
+      OPERATOR_ATTRIBUTES:columns as COLUMNS,
+      OPERATOR_ATTRIBUTES:functions as FUNCTIONS,
+      OPERATOR_ATTRIBUTES:offset as OFFSET,
+      OPERATOR_ATTRIBUTES:rows as NUMROWS,
+      OPERATOR_ATTRIBUTES:sort_keys as SORT_KEYS,
+      OPERATOR_ATTRIBUTES:grouping_keys as GROUPING_KEYS,
+      CASE WHEN OPERATOR_TYPE = 'UnionAll' and lag(OPERATOR_TYPE) over (ORDER BY OPERATOR_ID) = 'Aggregate' THEN 1 ELSE 0 END AS UNION_WITHOUT_ALL
+    from table(get_query_operator_stats('$(vQueryId)'));
+
+    Totals:
+    Replace Load
+        [QueryID],
+        Sum([Exploding Join Flag]) as TotalExploding,
+        Sum([Queries To Large Flag]) as TotalSpill,
+        Sum([Union Without All Flag]) as TotalUnions,
+        Sum([Inefficient Pruning Flag]) as TotalPruning
+    Resident [Query Stats]
+    Group By [QueryID];
+
+    Images:
+    Replace Load 
+        IF(Sum(TotalExploding) > 0, 'Exploding Join', null()) as Explanation,
+        IF(Sum(TotalExploding) > 0, 'http://qlikdork.com/wp-content/uploads/2023/03/Exploding-Join.png', null()) as Image,
+        IF(Sum(TotalExploding) > 0, 'https://docs.snowflake.com/en/user-guide/ui-snowsight-activity.html#exploding-joins', null()) as Link
+    Resident  Totals;
+
+    Concatenate (Images)
+    Add Load 
+        IF(Sum(TotalExploding) > 0, 'Union Without All', null()) as Explanation,
+        IF(Sum(TotalUnions) > 0, 'http://qlikdork.com/wp-content/uploads/2023/03/UnionWithoutAll.png', null()) as Image,
+        IF(Sum(TotalUnions) > 0, 'https://docs.snowflake.com/en/user-guide/ui-snowsight-activity.html#union-without-all', null()) as Link
+    Resident  Totals;
+
+    Concatenate (Images)
+    Add Load 
+        IF(Sum(TotalExploding) > 0, 'Disk Spillage', null()) as Explanation,
+        IF(Sum(TotalSpill) > 0, 'http://qlikdork.com/wp-content/uploads/2023/03/QueriesToLarge.png', null()) as Image,
+        IF(Sum(TotalSpill) > 0, 'https://docs.snowflake.com/en/user-guide/ui-snowsight-activity.html#queries-too-large-to-fit-in-memory', null()) as Link
+    Resident  Totals;
+
+    Concatenate (Images)
+    Add Load 
+        IF(Sum(TotalExploding) > 0, 'Inefficient Pruning', null()) as Explanation,
+        IF(Sum(TotalPruning) > 0, 'http://qlikdork.com/wp-content/uploads/2023/03/InefficientPruning.png', null()) as Image,
+        IF(Sum(TotalPruning) > 0, 'https://docs.snowflake.com/en/user-guide/ui-snowsight-activity.html#inefficient-pruning', null()) as Link
+    Resident  Totals; 
+    
+Else
+///$tab Startup spin through all Snowflake Instances
+// 📝 - You are welcome to add as many Snowflake instances as you have
+// the code will iterate through all that you add to the SnowflakeInstances Inline table below and load them
+
+// 💡 - Given how many variables were built into the code making all connections Persisted made for very fast reloads so we didn't bang our heads 
+// against the wall for adding 1 more variable, or 1 more measure island value. 
+
+// 3.1 enhancement for this table involved adding Costs and Credits Purchased as we found instances where customers had different cost struture for different instances.
+// Costs are now applied as the data is read for the Credit Usae and Metrics data as well as the Storage data. 
+
+// Get a count of how many instances exist 
+Let vNumRows = NoOfRows('SnowflakeInstances')-1;
+    
+// Iterate through all of the values for Snowflake Instances. 
+// The Peek function is 0 based which is why we wask for the number of rows and subtract 1 and start the counter at 0
+For i = 0 to $(vNumRows)
+ 	Let vConx = Peek ('SFConx',$(i),'SnowflakeInstances');
+    Let vDesc = Peek ('SFInstance',$(i),'SnowflakeInstances');
+    Let vCreditCost = Peek('CostPerCredit', $(i), 'SnowflakeInstances');
+    Let vStorageCostPerTB = Peek('CostPerTB', $(i), 'SnowflakeInstances');
+
+	LIB CONNECT TO '$(vDesc)';
+
+	// force Snowflake to Use Arrow Format for optimal performance
+    Set ODBC_RESULT_FORMAT = 'ARROW_FORCE';
+    
+    Trace 🏁 Just started the processing for $(vConx);
+
+
+
+
+
+
+///$tab Query History
+/* 📝 - Query History uses an incremental load technology which makes the code a little more complex than other reads as it has to check 
+whether or not the file exists. Since the first installation and run of this will obviously not have the files onsite.
+
+⭐ Version 4.0 - The Query History was becoming problematic at large customer sites so it is now read, and written
+but not retained within this application. Instead the values are aggregated up at the Snowflake Instance Level in
+an aggregate table instead and a link is provide to the Query Details application that will display all of the 
+information and allow for browsing at all levels. 
+
+⭐⭐  For Version 4.1 modify the Snowflake Query to only select the exact fields being retained. For now it all were left in, in case we realized
+we needed something and could quickly uncomment the LOAD command for Qlik. 
+*/ 
+
+
+// 🔥 We need to establish the where clause for the last X days 🔥
+Let vWhereClause = 'WHERE "START_TIME" > ''$(vMaxQueryTime)'';' ;
+Trace Max Query Time is: $(vWhereClause);
+
+[Query History]:
+Add LOAD '$(vConx)' as SFConx,
+  QUERY_ID, 
+  '$(vConx)'&"WAREHOUSE_NAME" & '-'&date(START_TIME)&hour(START_TIME) as usage_query_key,
+  '$(vConx)'&'_'&"DATABASE_NAME" AS "q_key",
+  QUERY_TEXT, 
+  DATABASE_ID, 
+  DATABASE_NAME as DB_NAME, 
+  SCHEMA_ID, 
+  SCHEMA_NAME, 
+  QUERY_TYPE, 
+  '$(vConx)'&'_'&SESSION_ID as SESSION_ID, 
+  USER_NAME as "Query History User Name",
+  //      '$(vConx)'&'_'&USER_NAME as USER_KEY, 
+  ROLE_NAME, 
+  If(IsNull(WAREHOUSE_ID), 'Unknown', WAREHOUSE_ID) as WAREHOUSE_ID, 
+  If(IsNull(WAREHOUSE_NAME), 'Unknown', WAREHOUSE_NAME) as WAREHOUSE_NAME, 
+  If(IsNull(WAREHOUSE_SIZE), 'Unknown', WAREHOUSE_SIZE) as WAREHOUSE_SIZE,
+  If(IsNull(WAREHOUSE_TYPE), 'Unknown', WAREHOUSE_TYPE) as WAREHOUSE_TYPE,
+  CLUSTER_NUMBER, 
+  QUERY_TAG, 
+  EXECUTION_STATUS, 
+  "ERROR_CODE" as QUERY_ERROR_CODE,
+  "ERROR_MESSAGE" as QUERY_ERROR_MESSAGE,
+  "START_TIME" as [Query Start Time],
+  Hour("START_TIME") as [Query Start Hour],
+  Weekday(START_TIME, 0) as [Query Start DOW],
+  IF(Date(Floor("START_TIME")) >=  Date(Floor(Now()-13)) and EXECUTION_STATUS = 'SUCCESS' and Match(QUERY_TYPE,'SHOW', 'EXCLUDE', 'SET', 'ALTER_SESSION', 'ALTER_TABLE_ADD_COLUMN', 'ALTER_TABLE_DROP_COLUMN', 'ALTER_TABLE_MODIFY_COLUMN', 'COMMIT', 'ROLLBACK', 'USE')=0 , Dual('Yes', 1), Dual('No', 0)) as [Qualified for Query Stats],
+  "END_TIME" as [Query End Time], 
+  Interval("END_TIME" - "START_TIME", 'hh:mm:ss') as [Execution Time],
+  TOTAL_ELAPSED_TIME, 
+  "TOTAL_ELAPSED_TIME"/1000 as elapsed_time_seconds,
+  BYTES_SCANNED, 
+  PERCENTAGE_SCANNED_FROM_CACHE, 
+  Num(BYTES_WRITTEN, '#,##0') as BYTES_WRITTEN,
+  Num(BYTES_WRITTEN_TO_RESULT, '#,##0') as BYTES_WRITTEN_TO_RESULT,
+  Num(BYTES_READ_FROM_RESULT, '#,##0') as BYTES_READ_FROM_RESULT, 
+  Num(ROWS_PRODUCED, '#,##0') as ROWS_PRODUCED, 
+  Num(ROWS_INSERTED, '#,##0') as ROWS_INSERTED, 
+  Num(ROWS_UPDATED, '#,##0') as ROWS_UPDATED, 
+  Num(ROWS_DELETED, '#,##0') as ROWS_DELETED, 
+  Num(ROWS_UNLOADED, '#,##0') as ROWS_UNLOADED, 
+  Num(BYTES_DELETED, '#,##0') as BYTES_DELETED, 
+  Num(PARTITIONS_SCANNED, '#,##0') as PARTITIONS_SCANNED, 
+  Num(PARTITIONS_TOTAL, '#,##0') as PARTITIONS_TOTAL, 
+  Num(BYTES_SPILLED_TO_LOCAL_STORAGE, '#,##0') as BYTES_SPILLED_TO_LOCAL_STORAGE, 
+  Num(BYTES_SPILLED_TO_REMOTE_STORAGE, '#,##0') as BYTES_SPILLED_TO_REMOTE_STORAGE, 
+  Num(BYTES_SENT_OVER_THE_NETWORK, '#,##0') as BYTES_SENT_OVER_THE_NETWORK, 
+  COMPILATION_TIME, 
+  EXECUTION_TIME, 
+  QUEUED_PROVISIONING_TIME, 
+  QUEUED_REPAIR_TIME, 
+  QUEUED_OVERLOAD_TIME, 
+  TRANSACTION_BLOCKED_TIME, 
+  OUTBOUND_DATA_TRANSFER_CLOUD, 
+  OUTBOUND_DATA_TRANSFER_REGION, 
+  OUTBOUND_DATA_TRANSFER_BYTES, 
+  INBOUND_DATA_TRANSFER_CLOUD, 
+  INBOUND_DATA_TRANSFER_REGION, 
+  INBOUND_DATA_TRANSFER_BYTES, 
+  LIST_EXTERNAL_FILES_TIME, 
+  CREDITS_USED_CLOUD_SERVICES as CREDITS_USED_CLOUD_SERVICES_QH, 
+  RELEASE_VERSION,
+  IF (EXECUTION_STATUS = 'SUCCESS', Dual('Yes', 1),Dual('No', 0)) as "Successfull Query Flag",
+  IF (EXECUTION_STATUS <> 'SUCCESS', Dual('Yes', 1),Dual('No', 0)) as "Failed Query Flag",
+  IF (BYTES_SPILLED_TO_LOCAL_STORAGE > 0, Dual('Yes', 1),Dual('No', 0)) as "Local Spillage Flag",
+  IF (BYTES_SPILLED_TO_REMOTE_STORAGE > 0, Dual('Yes', 1),Dual('No', 0)) as "Remote Spillage Flag",
+  IF (
+  (PARTITIONS_SCANNED > 0 and (PARTITIONS_SCANNED / PARTITIONS_TOTAL) > .5)
+  OR BYTES_SPILLED_TO_LOCAL_STORAGE > 0
+  OR BYTES_SPILLED_TO_REMOTE_STORAGE > 0, Dual('Yes', 1),Dual('No', 0)) as "Problematic Query Flag";
+
+SELECT 
+  "QUERY_ID",
+  "QUERY_TEXT",
+  "DATABASE_ID",
+  "DATABASE_NAME",
+  "SCHEMA_ID",
+  "SCHEMA_NAME",
+  "QUERY_TYPE",
+  "SESSION_ID",
+  "USER_NAME",
+  "ROLE_NAME",
+  "WAREHOUSE_ID",
+  "WAREHOUSE_NAME",
+  "WAREHOUSE_SIZE",
+  "WAREHOUSE_TYPE",
+  "CLUSTER_NUMBER",
+  "QUERY_TAG",
+  "EXECUTION_STATUS",
+  "ERROR_CODE",
+  "ERROR_MESSAGE",
+  "START_TIME",
+  "END_TIME",
+  "TOTAL_ELAPSED_TIME",
+  "BYTES_SCANNED",
+  "PERCENTAGE_SCANNED_FROM_CACHE",
+  "BYTES_WRITTEN",
+  "BYTES_WRITTEN_TO_RESULT",
+  "BYTES_READ_FROM_RESULT",
+  "ROWS_PRODUCED",
+  "ROWS_INSERTED",
+  "ROWS_UPDATED",
+  "ROWS_DELETED",
+  "ROWS_UNLOADED",
+  "BYTES_DELETED",
+  "PARTITIONS_SCANNED",
+  "PARTITIONS_TOTAL",
+  "BYTES_SPILLED_TO_LOCAL_STORAGE",
+  "BYTES_SPILLED_TO_REMOTE_STORAGE",
+  "BYTES_SENT_OVER_THE_NETWORK",
+  "COMPILATION_TIME",
+  "EXECUTION_TIME",
+  "QUEUED_PROVISIONING_TIME",
+  "QUEUED_REPAIR_TIME",
+  "QUEUED_OVERLOAD_TIME",
+  "TRANSACTION_BLOCKED_TIME",
+  "OUTBOUND_DATA_TRANSFER_CLOUD",
+  "OUTBOUND_DATA_TRANSFER_REGION",
+  "OUTBOUND_DATA_TRANSFER_BYTES",
+  "INBOUND_DATA_TRANSFER_CLOUD",
+  "INBOUND_DATA_TRANSFER_REGION",
+  "INBOUND_DATA_TRANSFER_BYTES",
+  "LIST_EXTERNAL_FILES_TIME",
+  "CREDITS_USED_CLOUD_SERVICES",
+  "RELEASE_VERSION"
+FROM SNOWFLAKE."ACCOUNT_USAGE"."QUERY_HISTORY"
+$(vWhereClause);
+  
+Warehouses:
+Add Load Distinct 
+      "WAREHOUSE_NAME",
+      MaxString("WAREHOUSE_SIZE") as "Correct Warehouse Size"
+Resident [Query History]
+Group by WAREHOUSE_NAME;
+
+///$tab Login History 
+// 🔥 We need to establish the where clause for the last X days 🔥
+Let vWhereClause = 'WHERE "EVENT_TIMESTAMP" > ''$(vMaxQueryTime)'';' ;
+Trace Max Query Time is: $(vWhereClause);
+
+[Login_History]:
+Add Load
+  '$(vConx)'&'_'&"EVENT_ID" as [LOGIN KEY],
+  "EVENT_TIMESTAMP",
+  1 as EVENT_COUNT,
+  "EVENT_TYPE",
+  Hash128("USER_NAME") as "USER_NAME",
+    "USER_NAME" as "Unhashed User Name",
+  "CLIENT_IP",
+  "REPORTED_CLIENT_TYPE",
+  "REPORTED_CLIENT_VERSION",
+  "FIRST_AUTHENTICATION_FACTOR",
+  "SECOND_AUTHENTICATION_FACTOR",
+  "IS_SUCCESS",
+  "ERROR_CODE" as LOGIN_ERROR_CODE,
+  "ERROR_MESSAGE" as LOGIN_ERROR_MESSAGE,
+  "RELATED_EVENT_ID";
+SQL SELECT "EVENT_ID",
+  "EVENT_TIMESTAMP",
+  "EVENT_TYPE",
+  "USER_NAME",
+  "CLIENT_IP",
+  "REPORTED_CLIENT_TYPE",
+  "REPORTED_CLIENT_VERSION",
+  "FIRST_AUTHENTICATION_FACTOR",
+  "SECOND_AUTHENTICATION_FACTOR",
+  "IS_SUCCESS",
+  "ERROR_CODE",
+  "ERROR_MESSAGE",
+  "RELATED_EVENT_ID"
+  FROM SNOWFLAKE."ACCOUNT_USAGE"."LOGIN_HISTORY"
+  $(vWhereClause);
+
+///$tab Sessions 
+/* 📝 -The CLIENT_ENVIRONMENT values weren't being tracked until July 23, 2020 so any decisions about Qlik Product usage
+are invalid until that date and moving forward. 
+
+The order of the wildcar searches is important as the value returned is then looked up in the ApplyMap to identify the product. 
+
+This could be changed to an incremental load process, however, you need to ensure that any load from an existing QVD gets the mapping reapplied 
+if you make any changes since the stored value for Connection_Type might change. 
+
+⭐ Version 4 - We realized that not all logins had sessions, so Login History is the table associated with the Snowflake Instance, and the Sessions table
+is now associated through the Loging History via the Login Key field. 
+*/
+
+// 🔥 We need to establish the where clause for the last X days 🔥
+Let vWhereClause = 'WHERE "CREATED_ON" > ''$(vMaxQueryTime)'';' ;
+Trace Max Query Time is: $(vWhereClause);
+
+[Sessions]:
+Add LOAD 
+    '$(vConx)'&'_'&SESSION_ID as SESSION_ID, 
+    "CLIENT_ENVIRONMENT" as CONNECTION_DETAILS,
+    '$(vConx)'&'_'&LOGIN_EVENT_ID as [LOGIN KEY],
+    ApplyMap('ConnectionMap',WildMatch(CLIENT_ENVIRONMENT, '*Replicate*', '*repctl*','*Compose*', '*QV*', '*QlikCustom*', '*LiveQuery*','*QCS*', '*{"OS":"Linux"*')) as [Connection Type];
+    SELECT "SESSION_ID",
+    "LOGIN_EVENT_ID" ,
+    "CLIENT_ENVIRONMENT",
+    "CREATED_ON"
+FROM "SNOWFLAKE"."ACCOUNT_USAGE"."SESSIONS"
+$(vWhereClause);
+
+
+
+
+///$tab Credit Usage and Metrics
+// 🔥 We need to establish the where clause for the last X days 🔥
+Let vWhereClause = 'WHERE "START_TIME" > ''$(vMaxQueryTime)''' ;
+Trace Max Query Time is: $(vWhereClause);
+
+// Collect metrics from the Credit Usage table --------
+[Credit_Usage]:
+Add LOAD 
+    Date("START_TIME") as Warehouse_Start_Time,
+    Year("START_TIME") as [Warehouse_Start_Time_Year],
+    Dual(Year(START_TIME)&'-'&Month(START_TIME), monthstart(START_TIME)) AS [Warehouse_Start_Time_YearMonth], 
+    Month(START_TIME) AS [Warehouse_Start_Time_Month],
+    Date(Floor(START_TIME)) AS [Warehouse_Start_Time_Date],
+
+	Date("END_TIME") as Warehouse_End_Time,  
+    Year("END_TIME") as [Warehouse_End_Time_Year],
+    Dual(Year(END_TIME)&'-'&Month(END_TIME), monthstart(END_TIME)) AS [Warehouse_End_Time_YearMonth], 
+    Month(END_TIME) AS [Warehouse_End_Time_Month],
+    Date(Floor(END_TIME)) AS [Warehouse_End_Time_Date],  
+    
+    '$(vConx)'&date("START_TIME") as metering_key,
+
+    "START_TIME" as START_TIMESTAMP,
+    "END_TIME"-"START_TIME" as Warehouse_Run_Time,
+    '$(vConx)'&"WAREHOUSE_NAME" &'-'&date(START_TIME)&hour(START_TIME) as usage_query_key,
+    "CREDITS_USED",
+    "CREDITS_USED" * $(vCreditCost) as [Usage Cost],
+    CREDITS_USED_COMPUTE,
+    CREDITS_USED_COMPUTE * $(vCreditCost) as [Compute Cost],
+    CREDITS_USED_CLOUD_SERVICES,
+    CREDITS_USED_CLOUD_SERVICES * $(vCreditCost) as [Cloud Cost] ;
+SQL SELECT "START_TIME",
+  "END_TIME",
+  "WAREHOUSE_NAME",
+  "CREDITS_USED",
+  CREDITS_USED_COMPUTE,
+  CREDITS_USED_CLOUD_SERVICES
+FROM "SNOWFLAKE"."ACCOUNT_USAGE"."WAREHOUSE_METERING_HISTORY" 
+$(vWhereClause);
+
+
+///$tab Storage
+// 🔥 We need to establish the where clause for the last X days 🔥
+Let vWhereClause = 'WHERE "USAGE_DATE" > ''$(vMaxQueryTime)'';' ;
+Trace Max Query Time is: $(vWhereClause);
+
+//Collect metrics from the Storage Metrics table --------
+[Storage_Usage]:
+Add LOAD 
+  date(USAGE_DATE) as Warehouse_Start_Time_Storage,
+  '$(vConx)'&date(USAGE_DATE) as metering_key,
+  month(USAGE_DATE)&'-'&year(USAGE_DATE) as [Month-Year Storage Usage],
+  "USAGE_DATE",
+  "STORAGE_BYTES",
+  ("STORAGE_BYTES" / 1000000000000) * $(vStorageCostPerTB) as [Storage Cost],
+  //Set vTotalStorage = Num(Sum(Aggr(Avg(STORAGE_BYTES/1000000000000),[Warehouse_Start_Time.autoCalendar.YearMonth])), '#,##0.00');
+  "STAGE_BYTES";
+SQL SELECT "USAGE_DATE",
+  "STORAGE_BYTES",
+  "STAGE_BYTES"
+FROM "SNOWFLAKE"."ACCOUNT_USAGE"."STORAGE_USAGE"
+$(vWhereClause); 
+
+
+///$tab Snowflake Databases
+[Databases]:
+Add LOAD 
+  1 as database_ctr,
+  //     '$(vConx)' as SFConx,
+  '$(vConx)'&'_'&name as [DatabaseKey],	
+  '$(vConx)'&'_'&name as [q_key],
+  name as database_name,
+  owner as database_owner,
+  comment as database_comment,
+  options as database_options,
+  origin as database_origin,
+  IF (origin > '', Dual('Yes', 1), Dual('No', 0)) as database_external_storage_flag,
+  IF (origin > '', Dual('No', 0), Dual('Yes', 1)) as database_internal_storage_flag;
+    
+sql show databases;
+
+///$tab Snowflake Tables
+[Tables]:
+Add LOAD 
+  1 as table_ctr,
+  name as table_name,
+  schema_name,
+  '$(vConx)'&'_'&database_name as [DatabaseKey],
+  kind as table_kind,
+  rows as row_count,
+  bytes as table_size,
+  owner as table_owner,
+  '$(vConx)'&'_'&database_name&schema_name&name as tckey;
+
+sql show tables in ACCOUNT ;
+
+
+
+
+///$tab Snowflake Columns
+[ColumnsTemp]:
+Add LOAD 
+  1 as column_ctr,
+  column_name,
+  kind as column_kind,
+  '$(vConx)'&'_'&database_name&schema_name&table_name as tckey_temp,
+  '$(vConx)'&'_'&database_name&schema_name&table_name&column_name as ckey;
+  
+sql show columns in ACCOUNT;
+  
+
+
+
+
+
+
+
+///$tab Metering
+// 🔥 We need to establish the where clause for the last X days 🔥
+Let vWhereClause = 'WHERE "USAGE_DATE" > ''$(vMaxQueryTime)'';' ;
+Trace Max Query Time is: $(vWhereClause);
+
+// Collect metrics from the Credit Usage table OLD VERSION --------
+// Only pulled in the event that an organization might have Credit Adjustments that they would like to take into account somehow
+// nothing in the application refers to any of these fields as of now
+[Metering Daily History]:
+Add LOAD 
+  '$(vConx)'&date(USAGE_DATE) as metering_key,
+  "CREDITS_USED_COMPUTE" as "CREDITS_USED_COMPUTE_DAILY",
+  "CREDITS_USED_CLOUD_SERVICES" as "CREDITS_USED_CLOUD_SERVICES_DAILY" ,
+  "CREDITS_USED" as "CREDITS_USED_DAILY",
+  "CREDITS_ADJUSTMENT_CLOUD_SERVICES" as "CREDITS_ADJUSTMENT_CLOUD_SERVICES_DAILY",
+  "CREDITS_BILLED" as "CREDITS_BILLED_DAILY" ;
+SELECT "SERVICE_TYPE",
+  "USAGE_DATE",
+  "CREDITS_USED_COMPUTE",
+  "CREDITS_USED_CLOUD_SERVICES",
+  "CREDITS_USED",
+  "CREDITS_ADJUSTMENT_CLOUD_SERVICES",
+  "CREDITS_BILLED"
+FROM "SNOWFLAKE"."ACCOUNT_USAGE"."METERING_DAILY_HISTORY"
+$(vWhereClause);
+
+
+///$tab Loop back to next Snowflake Instance
+// 📝 - Iterate to the next Snowflake Insance if there are any
+	Trace 🏁 Just finished processing $(vConx);
+Next i
+
+Trace 🛑 Outside of the Loop for Snowflake Instances now;
+
+
+// Now move the columnstemp to the real columns table for only those columns that actually match a table
+// While there are columns in Snowflake that are returned and DO NOT match a table name it will be confusing
+// if you understand the associative model and do want to see columns that do not match you can easily modify the code and simply rename the ColumnsTemp table and get rid of this section
+[Columns]:
+Add NoConcatenate  Load column_ctr, column_name, column_kind, tckey_temp as tckey, ckey
+Resident ColumnsTemp 
+where exists (tckey, tckey_temp);
+
+Drop table ColumnsTemp;
+
+
+///$tab Geo Analytics
+// 📝 - This section uses Qlik GeoAnalytics Engine to dynamically lookup IPs mined from the Login History Table.
+// You will need a valid license to use this connection and to have GeoAnalytics setup on your Qlik Server
+// IF you don't have GeoAnalytics installed then simply remove this section from the code, or move the entire section 
+// below the Exit Script section so that it won't run, but you have it, in the even you add it later and want to map
+// your connections 
+//
+// 🛑 - This code should be fired only once after all data has been loaded, so it has to be called after the Loop Back to Next Snowflake Instance section 
+//
+// As part of 3.1 and recognition of SaaS this code now uses the vWindowsOrSaaS variable to either use the GeoAnalytics connector that would be purchased in Windows or is available freely in SaaS
+IF (vType = 'Live') Then
+    Trace 🗺️ Creating the Geography data;
+
+    IPDistinct:
+    Add Load Distinct "CLIENT_IP" Resident [Login_History];
+
+    If (vWindowsOrSaaS = 'Windows') Then
+      LIB CONNECT TO 'QlikGEO (qlikpe_qlikservice)';
+      // Generated by GeoAnalytics for operation IPLookup ---------------------- 
+      [_inlineMap_]:
+      mapping LOAD * inline [
+      _char_, _utf_
+      "'", '\u0027'
+      '"', '\u0022'
+      "[", '\u005b'
+      "/", '\u002f'
+      "*", '\u002a'
+      ";", '\u003b'
+      "}", '\u007d'
+      "{", '\u007b'
+      "`", '\u0060'
+      "´", '\u00b4'
+      "	", '\u0009'
+      ];
+
+      IF FieldNumber('CLIENT_IP', 'IPDistinct') = 0 THEN
+      call InvalidInlineData('The field CLIENT_IP in IPDistinct is not available');
+      END IF
+      Let [IpTableInlineTable] = 'CLIENT_IP';
+      Let numRows = NoOfRows('IPDistinct');
+      Let chunkSize = 1000;
+      Let chunks = numRows/chunkSize;
+      For n = 0 to chunks
+      Let chunkText = '';
+      Let chunk = n*chunkSize;
+      For i = 0 To chunkSize-1
+      Let row = '';
+      Let rowNr = chunk+i;
+      Exit for when rowNr >= numRows;
+      For Each f In 'CLIENT_IP'
+      row = row & Chr(9) & MapSubString('_inlineMap_', Peek('$(f)', $(rowNr), 'IPDistinct'));
+      Next
+      chunkText = chunkText & Chr(10) & Mid('$(row)', 2);
+      Next
+      [IpTableInlineTable] = [IpTableInlineTable] & chunkText;
+      Next
+      chunkText=''
+
+      [IP Table]:
+      SQL SELECT [CLIENT_IP], [IpTable_Geometry], [CountryIso2], [IpTable_Adm1Code], [IpTable_City] FROM IPLookup(ipField='CLIENT_IP', ipTable='IpTable')
+      DATASOURCE IpTable INLINE tableName='IPDistinct', tableFields='CLIENT_IP', geometryType='NONE', loadDistinct='NO', suffix='', crs='Auto' {$(IpTableInlineTable)}
+      ;
+
+      [IpTableInlineTable] = '';
+    Else
+      [IP Table]:
+      Add Load CLIENT_IP, IpPoint, CountryIso2, Adm1Code as IPTable_Adm1Code, City as IpTable_City Extension GeoOperations.ScriptEval('IpLookup(ipField="CLIENT_IP")', IPDistinct{CLIENT_IP});
+    End If;
+
+    tag field [CLIENT_IP]  with '$primarykey';
+    tag field [IpTable_Geometry] with '$geopoint';
+    tag field [CLIENT_IP] with '$geoname';
+    tag field [IpTable_Geometry] with '$relates_CLIENT_IP';
+    tag field [CLIENT_IP] with '$relates_IpTable_Geometry';
+
+    Drop Table IPDistinct;
+
+End If;
+
+///$tab Derived Dates
+/* 📝 - This section auto build dynamic date values 
+Not all values are currently used in the application so feel free to comment those you don't care to have taking up space
+
+We left all of the automated derived values here so others could see you can easily use the same code from a Data Load Wizard
+for any of your other applications
+*/
+
+Trace ❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️ Deriving the dates automatically;
+
+[autoCalendar]: 
+  DECLARE FIELD DEFINITION Tagged ('$date')
+FIELDS
+  Dual(Year($1), YearStart($1)) AS [Year] Tagged ('$axis', '$year'),
+  If (Year($1) = Year(Now()), Dual('Yes', 1), Dual('No', 0)) as [CurrentYear] ,
+  Dual(Year($1)&'-'&Month($1), monthstart($1)) AS [YearMonth] Tagged ('$axis', '$yearmonth', '$qualified'),
+  Date(Floor($1)) AS [Date] Tagged ('$axis', '$date', '$qualified'),
+  Month($1) AS [Month] Tagged ('$month', '$cyclic');
+  
+  
+//   Dual('Q'&Num(Ceil(Num(Month($1))/3)),Num(Ceil(NUM(Month($1))/3),00)) AS [Quarter] Tagged ('$quarter', '$cyclic'),
+//   Dual(Year($1)&'-Q'&Num(Ceil(Num(Month($1))/3)),QuarterStart($1)) AS [YearQuarter] Tagged ('$yearquarter', '$qualified'),
+//   Dual('Q'&Num(Ceil(Num(Month($1))/3)),QuarterStart($1)) AS [_YearQuarter] Tagged ('$yearquarter', '$hidden', '$simplified'),
+//   Dual(Month($1), monthstart($1)) AS [_YearMonth] Tagged ('$axis', '$yearmonth', '$simplified', '$hidden'),
+//   Dual('W'&Num(Week($1),00), Num(Week($1),00)) AS [Week] Tagged ('$weeknumber', '$cyclic'),
+//   Date(Floor($1), 'D') AS [_Date] Tagged ('$axis', '$date', '$hidden', '$simplified'),
+//   If (DayNumberOfYear($1) <= DayNumberOfYear(Today()), 1, 0) AS [InYTD] ,
+//   Year(Today())-Year($1) AS [YearsAgo] ,
+//   If (DayNumberOfQuarter($1) <= DayNumberOfQuarter(Today()),1,0) AS [InQTD] ,
+//   4*Year(Today())+Ceil(Month(Today())/3)-4*Year($1)-Ceil(Month($1)/3) AS [QuartersAgo] ,
+//   Ceil(Month(Today())/3)-Ceil(Month($1)/3) AS [QuarterRelNo] ,
+//   If(Day($1)<=Day(Today()),1,0) AS [InMTD] ,
+//   12*Year(Today())+Month(Today())-12*Year($1)-Month($1) AS [MonthsAgo] ,
+//   Month(Today())-Month($1) AS [MonthRelNo] ,
+//   If(WeekDay($1)<=WeekDay(Today()),1,0) AS [InWTD] ,
+//   (WeekStart(Today())-WeekStart($1))/7 AS [WeeksAgo] ,
+//   Week(Today())-Week($1) AS [WeekRelNo];
+
+DERIVE FIELDS FROM FIELDS [Query Start Time], [Query End Time], [EVENT_TIMESTAMP] USING [autoCalendar] ;
+
+Trace ❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️ Done;
+///$tab Wrap it up
+// We don't need the sorted days of week anymore
+drop table SortedDaysOfWeek;
+
+End If; // End of Full Load text
+
+///$tab Exit script
+Exit Script;
+///$tab CostCenter
+// Version 4.0
+//
+// There are always times when you need data from disparate sources
+// A Cost Center breakdown to roll up costs across end users is a great example so we have added a very rough example to demonstrate
+// Feel free to add whatever other fields you wish, or source from a real data source instead of using an XLS sheet
+//
+// If you have a data source which ties users to cost centers feel free to move this code above the Exit Script section and uncomment it. 
+
+// [Cost Center Reference]:
+// LOAD
+//     Hash128(USER_NAME) as USER_NAME,
+//     Trigram,
+//     Hash128(Name) AS USER_Full_Name,
+//     "Cost Center"
+// FROM [lib://AttachedFiles/Users-Cost Centers.xlsx]
+// (ooxml, embedded labels, table is Sheet1);
+
